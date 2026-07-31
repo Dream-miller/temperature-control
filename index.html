@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>生產環境溫度管控平台</title>
+    <!-- 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 React 與 ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- 引入 React 專用的 Lucide 圖示版本 -->
+    <script src="https://unpkg.com/lucide-react@0.292.0/dist/umd/lucide-react.min.js"></script>
+    <!-- 引入其他工具 -->
+    <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>body { font-family: 'Inter', sans-serif; }</style>
+</head>
+<body class="bg-slate-100">
+    <div id="root"></div>
+
+    <!-- GAS 程式碼範本隱藏區，避免 JS 字串語法衝突 -->
+    <textarea id="gasCodeTemplate" style="display:none;">
+// ===== Google Apps Script (GAS) 完整後端程式碼 =====
+function testDirectWrite() {
+  var sampleTemp = {};
+  var now = new Date();
+  var dateKey = now.getFullYear() + "/" + 
+    String(now.getMonth() + 1).padStart(2, '0') + "/" + 
+    String(now.getDate()).padStart(2, '0') + " " + 
+    String(now.getHours()).padStart(2, '0') + ":00";
+  
+  sampleTemp[dateKey] = [25.0, 25.5, 24.2, 24.8, 25.1];
+  var sampleEvent = {};
+  sampleEvent[dateKey] = "GAS 測試寫入成功";
+
+  var result = syncToGoogleSheet(sampleTemp, sampleEvent);
+  Logger.log("測試寫入結果: " + JSON.stringify(result));
+}
+
+function doGet(e) {
+  var sheetMsg = "";
+  if (e && e.parameter && e.parameter.payload) {
+    try {
+      var payload = JSON.parse(decodeURIComponent(e.parameter.payload));
+      var res1 = syncToGoogleSheet(payload.temperatureData, payload.specialEvents);
+      sheetMsg = res1.message;
+    } catch (payloadErr) {
+      sheetMsg = "Payload parse note: " + payloadErr;
+    }
+  }
+
+  var sheetData = readFromGoogleSheet();
+  var result = {
+    temperatureData: sheetData.temperatureData,
+    specialEvents: sheetData.specialEvents,
+    status: 'success',
+    sheetWriteMessage: sheetMsg,
+    timestamp: new Date().toISOString()
+  };
+  
+  var callback = e && e.parameter && e.parameter.callback;
+  if (callback) {
+    return ContentService.createTextOutput(callback + '(' + JSON.stringify(result) + ')').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function doPost(e) {
+  try {
+    var contents = e.postData.contents;
+    var postData = JSON.parse(contents);
+    var res = syncToGoogleSheet(postData.temperatureData, postData.specialEvents);
+    var output = JSON.stringify({ status: 'success', message: 'Data saved successfully', sheetWriteMessage: res.message });
+    return ContentService.createTextOutput(output).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    var errOutput = JSON.stringify({ status: 'error', message: err.toString() });
+    return ContentService.createTextOutput(errOutput).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function readFromGoogleSheet() {
+  var ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  if (!ss) return { temperatureData: {}, specialEvents: {} };
+
+  var sheet = ss.getSheetByName("溫度紀錄");
+  if (!sheet || sheet.getLastRow() <= 1) return { temperatureData: {}, specialEvents: {} };
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 7).getValues();
+  var tempData = {};
+  var specEvents = {};
+
+  for (var i = 0; i < values.length; i++) {
+    var row = values[i];
+    var key = row[0];
+    if (!key) continue;
+
+    var keyStr = String(key).trim();
+    if (key instanceof Date) {
+      keyStr = Utilities.formatDate(key, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+    } else {
+      keyStr = keyStr.replace(new RegExp('/', 'g'), '-');
+    }
+
+    var rowVals = [
+      (row[1] !== "" && row[1] !== null && !isNaN(row[1])) ? Number(row[1]) : null,
+      (row[2] !== "" && row[2] !== null && !isNaN(row[2])) ? Number(row[2]) : null,
+      (row[3] !== "" && row[3] !== null && !isNaN(row[3])) ? Number(row[3]) : null,
+      (row[4] !== "" && row[4] !== null && !isNaN(row[4])) ? Number(row[4]) : null,
+      (row[5] !== "" && row[5] !== null && !isNaN(row[5])) ? Number(row[5]) : null
+    ];
+    tempData[keyStr] = rowVals;
+    if (row[6]) specEvents[keyStr] = String(row[6]);
+  }
+  return { temperatureData: tempData, specialEvents: specEvents };
+}
+
+function syncToGoogleSheet(tempData, specialEvents) {
+  if (!tempData || typeof tempData !== 'object') return { success: false, message: "無數據可寫入" };
+  var keys = Object.keys(tempData);
+  if (keys.length === 0) return { success: false, message: "數據長度為 0" };
+
+  var ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  if (!ss) return { success: false, message: "⚠️ 錯誤：找不到綁定的 Google 試算表！" };
+
+  var sheet = ss.getSheetByName("溫度紀錄");
+  if (!sheet) sheet = ss.insertSheet("溫度紀錄");
+  var headers = ["日期時間", "AA 2F", "AA 3F", "SMT L1", "SMT L2", "SMT L3", "特殊事件備註"];
+  
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#e0f2fe");
+  }
+
+  var existingMap = {};
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    var allRows = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+    for (var r = 0; r < allRows.length; r++) {
+      var k = allRows[r][0];
+      if (k) {
+        var kStr = String(k).trim();
+        if (k instanceof Date) kStr = Utilities.formatDate(k, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm");
+        else kStr = kStr.replace(new RegExp('/', 'g'), '-');
+        existingMap[kStr] = allRows[r];
+      }
+    }
+  }
+
+  for (var i = 0; i < keys.length; i++) {
+    var rawKey = keys[i];
+    var normKey = String(rawKey).trim().replace(new RegExp('/', 'g'), '-');
+    var rowArr = tempData[rawKey] || [];
+    var eventNote = (specialEvents && (specialEvents[rawKey] || specialEvents[normKey])) ? (specialEvents[rawKey] || specialEvents[normKey]) : "";
+
+    var rowData = [
+      normKey,
+      (rowArr[0] !== null && rowArr[0] !== undefined) ? rowArr[0] : "",
+      (rowArr[1] !== null && rowArr[1] !== undefined) ? rowArr[1] : "",
+      (rowArr[2] !== null && rowArr[2] !== undefined) ? rowArr[2] : "",
+      (rowArr[3] !== null && rowArr[3] !== undefined) ? rowArr[3] : "",
+      (rowArr[4] !== null && rowArr[4] !== undefined) ? rowArr[4] : "",
+      eventNote
+    ];
+
+    if (existingMap[normKey]) {
+      for (var col = 1; col <= 5; col++) {
+        if (rowData[col] === "" && existingMap[normKey][col] !== "") rowData[col] = existingMap[normKey][col];
+      }
+      if (rowData[6] === "" && existingMap[normKey][6] !== "") rowData[6] = existingMap[normKey][6];
+    }
+    existingMap[normKey] = rowData;
+  }
+
+  var sortedKeys = Object.keys(existingMap).sort();
+  var finalValues = [];
+  for (var k = 0; k < sortedKeys.length; k++) finalValues.push(existingMap[sortedKeys[k]]);
+  
+  if (finalValues.length > 0) sheet.getRange(2, 1, finalValues.length, headers.length).setValues(finalValues);
+  return { success: true, message: "已成功整批寫入 " + finalValues.length + " 筆數據至「溫度紀錄」試算表！" };
+}
+    </textarea>
+
+    <script type="text/babel">
+        // 1. 全域依賴對應
+        const { useState, useEffect, useMemo, useRef } = React;
+        const QRCode = window.QRCode;
+        const XLSX = window.XLSX;
+        const Chart = window.Chart;
+        
+        // 2. 防呆圖示讀取機制
+        const getIcon = (name) => {
+            const IconComponent = window.lucideReact ? window.lucideReact[name] : null;
+            if (IconComponent) return IconComponent;
+            return () => <span style={{fontSize:'0.8em'}}>🔸</span>;
+        };
+
+        const BarChart3 = getIcon('BarChart3');
+        const ChevronLeft = getIcon('ChevronLeft');
+        const ChevronRight = getIcon('ChevronRight');
+        const Download = getIcon('Download');
+        const FileSpreadsheet = getIcon('FileSpreadsheet');
+        const Plus = getIcon('Plus');
+        const Minus = getIcon('Minus');
+        const RotateCcw = getIcon('RotateCcw');
+        const Upload = getIcon('Upload');
+        const X = getIcon('X');
+        const AlertCircle = getIcon('AlertCircle');
+        const CheckCircle2 = getIcon('CheckCircle2');
+        const Info = getIcon('Info');
+        const Thermometer = getIcon('Thermometer');
+        const RefreshCw = getIcon('RefreshCw');
+        const Settings = getIcon('Settings');
+        const QrCodeIcon = getIcon('QrCode');
+        const Smartphone = getIcon('Smartphone');
+        const Copy = getIcon('Copy');
+        const Check = getIcon('Check');
+        const ExternalLink = getIcon('ExternalLink');
+        const Database = getIcon('Database');
+        const Lock = getIcon('Lock');
+        const Unlock = getIcon('Unlock');
+        const ShieldCheck = getIcon('ShieldCheck');
+        const Key = getIcon('Key');
+        const Trash2 = getIcon('Trash2');
+
+        // 3. 原生 Chart.js 穩定封裝
+        function SafeLineChart({ data, options }) {
+            const canvasRef = useRef(null);
+            const chartInstance = useRef(null);
+            useEffect(() => {
+                if (chartInstance.current) chartInstance.current.destroy();
+                chartInstance.current = new Chart(canvasRef.current, { type: 'line', data, options });
+                return () => { if (chartInstance.current) chartInstance.current.destroy(); };
+            }, [data, options]);
+            return <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />;
+        }
+
+        // 4. 系統常數
+        const STATIONS = ['AA 2F', 'AA 3F', 'SMT L1', 'SMT L2', 'SMT L3'];
+        const CONTROL_UPPER = 30;
+        const CONTROL_LOWER = 20;
+
+        // 5. 畫面崩潰攔截器 (ErrorBoundary)
+        class ErrorBoundary extends React.Component {
+            constructor(props) {
+                super(props);
+                this.state = { hasError: false, errorInfo: null };
+            }
+            static getDerivedStateFromError(error) {
+                return { hasError: true, errorInfo: error };
+            }
+            render() {
+                if (this.state.hasError) {
+                    return (
+                        <div style={{ padding: '2rem', color: '#dc2626', fontFamily: 'sans-serif' }}>
+                            <h2 style={{ fontWeight: 'bold', fontSize: '1.5rem' }}>畫面渲染發生錯誤 😭</h2>
+                            <p>請將以下錯誤訊息提供給開發者：</p>
+                            <pre style={{ background: '#fef2f2', padding: '1rem', marginTop: '1rem', borderRadius: '0.5rem', whiteSpace: 'pre-wrap' }}>
+                                {this.state.errorInfo && this.state.errorInfo.toString()}
+                            </pre>
+                        </div>
+                    );
+                }
+                return this.props.children;
+            }
+        }
+
+        // 6. 主程式 App
+        function App() {
+          const [currentDate, setCurrentDate] = useState(new Date());
+          
+          // ✨ 您專屬的 GAS 網址已預設綁定
+          const defaultGasUrl = 'https://script.google.com/macros/s/AKfycbyVP7lV-hx_NtZqVydqjQzDXhOXArYy1C9r0VH9cgW7VCdzW5u8DMeuY0i6BNHftZKl/exec';
+          const [gasUrl, setGasUrl] = useState(() => {
+            try {
+              const params = new URLSearchParams(window.location.search);
+              const urlGas = params.get('gasUrl') || params.get('gas');
+              if (urlGas) {
+                const decoded = decodeURIComponent(urlGas);
+                localStorage.setItem('tempControlGasUrl_V1', decoded);
+                return decoded;
+              }
+            } catch (e) {}
+            return localStorage.getItem('tempControlGasUrl_V1') || defaultGasUrl;
+          });
+
+          const [showGasModal, setShowGasModal] = useState(false);
+          const [gasInput, setGasInput] = useState('');
+          const [isSyncing, setIsSyncing] = useState(false);
+          const [gasCodeCopied, setGasCodeCopied] = useState(false);
+          const [testStatus, setTestStatus] = useState({ running: false, message: '', type: null });
+
+          // ✨ 安全升級：管理員密碼預設改為 1113
+          const [adminPin, setAdminPin] = useState(() => localStorage.getItem('tempControlAdminPin_V1') || '1113');
+          const [isAdminUnlocked, setIsAdminUnlocked] = useState(false);
+          const [showAdminAuthModal, setShowAdminAuthModal] = useState(false);
+          const [showAdminPanelModal, setShowAdminPanelModal] = useState(false);
+          const [adminPinInput, setAdminPinInput] = useState('');
+          const [adminPinError, setAdminPinError] = useState('');
+          const [adminNewPinInput, setAdminNewPinInput] = useState('');
+
+          const handleOpenAdminSettings = () => {
+            if (isAdminUnlocked) {
+              setGasInput(gasUrl);
+              setShowAdminPanelModal(true);
+            } else {
+              setAdminPinInput('');
+              setAdminPinError('');
+              setShowAdminAuthModal(true);
+            }
+          };
+
+          const handleVerifyAdminPin = (e) => {
+            if (e) e.preventDefault();
+            if (adminPinInput.trim() === adminPin) {
+              setIsAdminUnlocked(true);
+              setShowAdminAuthModal(false);
+              setGasInput(gasUrl);
+              setShowAdminPanelModal(true);
+              addToast('🔓 管理員權限驗證成功', 'success');
+            } else {
+              // ✨ 移除了預設密碼的提示，確保安全性
+              setAdminPinError('密碼錯誤！請輸入正確的管理員密碼。');
+            }
+          };
+
+          const handleChangeAdminPin = () => {
+            if (!adminNewPinInput.trim()) {
+              addToast('請輸入新密碼', 'error');
+              return;
+            }
+            setAdminPin(adminNewPinInput.trim());
+            localStorage.setItem('tempControlAdminPin_V1', adminNewPinInput.trim());
+            setAdminNewPinInput('');
+            addToast('🔑 管理員密碼已成功變更！', 'success');
+          };
+
+          const handleLockAdminPanel = () => {
+            setIsAdminUnlocked(false);
+            setShowAdminPanelModal(false);
+            addToast('🔒 已安全鎖定管理員控制台', 'info');
+          };
+
+          useEffect(() => {
+            try {
+              const params = new URLSearchParams(window.location.search);
+              const urlGas = params.get('gasUrl') || params.get('gas');
+              if (urlGas) {
+                const decoded = decodeURIComponent(urlGas);
+                if (decoded && decoded !== gasUrl) {
+                  setGasUrl(decoded);
+                  localStorage.setItem('tempControlGasUrl_V1', decoded);
+                }
+              }
+            } catch (e) {}
+          }, []);
+
+          const [temperatureData, setTemperatureData] = useState(() => {
+            try { return JSON.parse(localStorage.getItem('tempControlData_HourlyV1')) || {}; } 
+            catch { return {}; }
+          });
+
+          const [specialEvents, setSpecialEvents] = useState(() => {
+            try { return JSON.parse(localStorage.getItem('tempControlEvents_HourlyV1')) || {}; } 
+            catch { return {}; }
+          });
+
+          const [showRealtimeModal, setShowRealtimeModal] = useState(false);
+          const [showSmtImportModal, setShowSmtImportModal] = useState(false);
+          const [showResetModal, setShowResetModal] = useState(false);
+          const [showQrModal, setShowQrModal] = useState(false);
+          const [qrCodeDataUrl, setQrCodeDataUrl] = useState('');
+          const [customQrUrl, setCustomQrUrl] = useState('');
+          const [copiedLink, setCopiedLink] = useState(false);
+
+          const checkShouldShowMobile = () => {
+            if (typeof window === 'undefined') return false;
+            const hash = window.location.hash || '';
+            const search = window.location.search || '';
+            const params = new URLSearchParams(search);
+            if (hash.includes('mobile') || params.get('mode') === 'mobile' || localStorage.getItem('tempControlViewMode') === 'mobile') {
+              return true;
+            }
+            if (window.innerWidth <= 768) return true;
+            return false;
+          };
+
+          const [isMobileView, setIsMobileView] = useState(checkShouldShowMobile);
+          const [mobileLocation, setMobileLocation] = useState('AA 2F');
+          
+          const getNowDate = () => {
+            const now = new Date();
+            return now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+          };
+          const getNowTime = () => String(new Date().getHours()).padStart(2, '0') + ':00';
+
+          const [mobileDate, setMobileDate] = useState(getNowDate);
+          const [mobileTime, setMobileTime] = useState(getNowTime);
+          const [mobileTemp, setMobileTemp] = useState('25.0');
+          const [mobileEventDesc, setMobileEventDesc] = useState('');
+
+          const targetMobileUrl = useMemo(() => {
+            if (customQrUrl && customQrUrl.trim()) return customQrUrl.trim();
+            return window.location.origin + window.location.pathname + '?mode=mobile#mobile';
+          }, [customQrUrl, gasUrl]);
+
+          useEffect(() => {
+            if (showQrModal && QRCode) {
+              QRCode.toDataURL(targetMobileUrl, { width: 320, margin: 2 })
+                .then(setQrCodeDataUrl).catch(console.error);
+            }
+          }, [showQrModal, targetMobileUrl]);
+
+          const switchToDesktopView = () => {
+            localStorage.setItem('tempControlViewMode', 'desktop');
+            setIsMobileView(false);
+            window.location.hash = '';
+          };
+          
+          const switchToMobileView = () => {
+            localStorage.setItem('tempControlViewMode', 'mobile');
+            setIsMobileView(true);
+            window.location.hash = 'mobile';
+          };
+
+          const [toasts, setToasts] = useState([]);
+          const addToast = (text, type = 'info') => {
+            const id = Math.random().toString(36).substring(2, 9);
+            setToasts((prev) => [...prev, { id, type, text }]);
+            setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
+          };
+
+          useEffect(() => localStorage.setItem('tempControlData_HourlyV1', JSON.stringify(temperatureData)), [temperatureData]);
+          useEffect(() => localStorage.setItem('tempControlEvents_HourlyV1', JSON.stringify(specialEvents)), [specialEvents]);
+
+          const formatDate = (d) => {
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+          };
+
+          const formatDateTime = (dateInput) => {
+            if (!dateInput) return null;
+            if (typeof dateInput === 'string') {
+              const cleaned = dateInput.trim().replace(/\//g, '-').replace(/\./g, '-');
+              const match = cleaned.match(/^(\d{4})[-](\d{1,2})[-](\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+              if (match) {
+                const y = match[1];
+                const m = match[2].padStart(2, '0');
+                const d = match[3].padStart(2, '0');
+                const hh = (match[4] || '00').padStart(2, '0');
+                const mm = (match[5] || '00').padStart(2, '0');
+                return y + '-' + m + '-' + d + ' ' + hh + ':' + mm;
+              }
+            }
+            const d = new Date(dateInput);
+            if (isNaN(d.getTime())) return null;
+            return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+          };
+
+          const getStartOfWeek = (d) => {
+            const res = new Date(d);
+            const day = res.getDay();
+            const diff = res.getDate() - day + (day === 0 ? -6 : 1);
+            res.setDate(diff);
+            return res;
+          };
+
+          const getShortDateTime = (datetimeStr) => {
+            const parts = datetimeStr.split(' ');
+            if (parts.length < 2) return datetimeStr;
+            const dPart = parts[0].split('-');
+            return parseInt(dPart[1], 10) + '/' + parseInt(dPart[2], 10) + ' ' + parts[1];
+          };
+
+          const changeWeek = (offset) => {
+            const newD = new Date(currentDate);
+            newD.setDate(newD.getDate() + offset * 7);
+            setCurrentDate(newD);
+          };
+
+          const startOfWeek = useMemo(() => getStartOfWeek(currentDate), [currentDate]);
+          const endOfWeek = useMemo(() => {
+            const end = new Date(startOfWeek);
+            end.setDate(startOfWeek.getDate() + 6);
+            return end;
+          }, [startOfWeek]);
+
+          const weekTimeKeys = useMemo(() => {
+            const startStr = formatDate(startOfWeek);
+            const endStr = formatDate(endOfWeek);
+            const allKeys = Object.keys(temperatureData).sort();
+            const keysInWeek = allKeys.filter((k) => k.split(' ')[0] >= startStr && k.split(' ')[0] <= endStr);
+
+            if (keysInWeek.length === 0) {
+              const defaultKeys = [];
+              for (let i = 0; i < 7; i++) {
+                const d = new Date(startOfWeek);
+                d.setDate(startOfWeek.getDate() + i);
+                defaultKeys.push(formatDate(d) + ' 12:00');
+              }
+              return defaultKeys;
+            }
+            return keysInWeek;
+          }, [startOfWeek, endOfWeek, temperatureData]);
+
+          const chartData = useMemo(() => {
+            const labels = weekTimeKeys.map((k) => getShortDateTime(k));
+
+            const datasets = STATIONS.map((station, index) => {
+              const isSMT = station.includes('SMT');
+              return {
+                label: station,
+                data: weekTimeKeys.map(key => temperatureData[key] ? temperatureData[key][index] : null),
+                borderColor: isSMT ? 'hsl(270, 75%, ' + (45 + index * 10) + '%)' : 'hsl(200, 85%, ' + (38 + index * 12) + '%)',
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointBackgroundColor: '#ffffff',
+                pointBorderColor: isSMT ? 'hsl(270, 75%, 50%)' : 'hsl(200, 85%, 45%)',
+                pointRadius: 3,
+                spanGaps: true
+              };
+            });
+
+            datasets.push({
+              label: '上限管制 (' + CONTROL_UPPER + '℃)',
+              data: weekTimeKeys.map(() => CONTROL_UPPER),
+              borderColor: '#ef4444',
+              borderWidth: 2,
+              borderDash: [5, 5],
+              pointRadius: 0,
+              fill: false
+            });
+
+            datasets.push({
+              label: '下限管制 (' + CONTROL_LOWER + '℃)',
+              data: weekTimeKeys.map(() => CONTROL_LOWER),
+              borderColor: '#3b82f6',
+              borderWidth: 2,
+              borderDash: [5, 5],
+              pointRadius: 0,
+              fill: false
+            });
+
+            return { labels, datasets };
+          }, [weekTimeKeys, temperatureData]);
+
+          const chartOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'top' } },
+            scales: { y: { min: 15, max: 40 } }
+          };
+
+          const syncDataFromCloud = async (silent = false) => {
+            if (!gasUrl.trim()) return;
+            if(!silent) setIsSyncing(true);
+            try {
+              const targetUrl = gasUrl.trim() + (gasUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+              const res = await fetch(targetUrl);
+              const text = await res.text();
+              let parsed = null;
+              try { parsed = JSON.parse(text); } catch {
+                const match = text.match(/^[a-zA-Z0-9_]+\((.*)\);?$/s);
+                if (match) parsed = JSON.parse(match[1]);
+              }
+              if (parsed && parsed.temperatureData) {
+                setTemperatureData(parsed.temperatureData);
+                if (parsed.specialEvents) setSpecialEvents(parsed.specialEvents);
+                if(!silent) addToast('✅ 已同步 Google 雲端數據！', 'success');
+              }
+            } catch (e) {
+                if(!silent) addToast('⚠️ 雲端連線異常，請確認是否為 Google 帳號存取阻擋', 'error');
+            }
+            if(!silent) setIsSyncing(false);
+          };
+
+          // 網頁初次載入時，自動去雲端抓取一次資料！
+          useEffect(() => {
+              if(gasUrl && Object.keys(temperatureData).length === 0) {
+                  syncDataFromCloud(true);
+              }
+          }, []);
+
+          const syncDataToCloud = async (newData, newEvents) => {
+            if (!gasUrl.trim()) return;
+            const payloadJson = JSON.stringify({ temperatureData: newData, specialEvents: newEvents });
+            try {
+              await fetch(gasUrl.trim(), { method: 'POST', mode: 'no-cors', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: payloadJson });
+            } catch (err) {}
+          };
+
+          const testGasConnection = async () => {
+             const url = gasInput.trim();
+             if (!url) return setTestStatus({ running: false, message: '請輸入網址', type: 'error' });
+             setTestStatus({ running: true, message: '測試中...', type: 'info' });
+             try {
+               const res = await fetch(url);
+               if (res.url.includes('accounts.google')) throw new Error('AUTH');
+               setTestStatus({ running: false, message: '✅ 測試成功！API 連線正常', type: 'success' });
+             } catch {
+               setTestStatus({ running: false, message: '❌ 連線被阻擋，請將權限設為「所有人」', type: 'error' });
+             }
+          };
+
+          const copyGasCode = () => {
+            const code = document.getElementById('gasCodeTemplate').value;
+            navigator.clipboard.writeText(code).then(() => {
+              setGasCodeCopied(true);
+              addToast('📋 已成功複製完整的 GAS 後端程式碼！', 'success');
+              setTimeout(() => setGasCodeCopied(false), 2500);
+            }).catch(() => addToast('複製失敗，請手動複製', 'error'));
+          };
+
+          // Handlers
+          const adjustMobileTemp = (delta) => {
+            const current = parseFloat(mobileTemp) || 25.0;
+            const updated = Math.round((current + delta) * 10) / 10;
+            setMobileTemp(updated.toFixed(1));
+          };
+
+          const copyMobileLink = () => {
+            navigator.clipboard.writeText(targetMobileUrl).then(() => {
+              setCopiedLink(true);
+              addToast('📋 已複製手機巡檢網址！', 'success');
+              setTimeout(() => setCopiedLink(false), 2500);
+            }).catch(() => addToast('複製網址失敗', 'error'));
+          };
+
+          const downloadQrCodeImage = () => {
+            if (!qrCodeDataUrl) return;
+            const a = document.createElement('a');
+            a.href = qrCodeDataUrl;
+            a.download = 'AA_巡檢手機版_QRCode.png';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            addToast('📥 已下載 QR Code 圖檔！', 'success');
+          };
+
+          const handleMobileSave = () => {
+            if (!mobileDate || !mobileTime) return addToast('請完整選擇日期時間', 'error');
+            const datetimeStr = mobileDate + ' ' + mobileTime;
+            const locIndex = STATIONS.indexOf(mobileLocation);
+            
+            const updatedData = { ...temperatureData };
+            if (!updatedData[datetimeStr]) updatedData[datetimeStr] = new Array(STATIONS.length).fill(null);
+            else updatedData[datetimeStr] = [...updatedData[datetimeStr]];
+            
+            if (mobileTemp !== '') updatedData[datetimeStr][locIndex] = parseFloat(mobileTemp);
+            
+            const updatedEvents = { ...specialEvents };
+            if (mobileEventDesc.trim() !== '') updatedEvents[datetimeStr] = mobileEventDesc.trim();
+            else if (updatedEvents[datetimeStr] && mobileTemp !== '') delete updatedEvents[datetimeStr];
+            
+            setTemperatureData(updatedData);
+            setSpecialEvents(updatedEvents);
+            if (gasUrl.trim()) syncDataToCloud(updatedData, updatedEvents);
+            addToast('✅ 已儲存 ' + datetimeStr + ' ' + mobileLocation, 'success');
+
+            const currentIndex = STATIONS.indexOf(mobileLocation);
+            if (currentIndex >= 0 && currentIndex < STATIONS.length - 1) {
+              const nextStation = STATIONS[currentIndex + 1];
+              setMobileLocation(nextStation);
+              const existingNextVal = updatedData[datetimeStr]?.[currentIndex + 1];
+              if (existingNextVal !== null && existingNextVal !== undefined) setMobileTemp(String(existingNextVal));
+            }
+            setMobileEventDesc('');
+          };
+
+          const handleOpenRealtimeModal = () => {
+            const now = new Date();
+            const dateStr = formatDate(now);
+            const hourStr = String(now.getHours()).padStart(2, '0') + ':00';
+            setRtDate(dateStr);
+            setRtTime(hourStr);
+            setRtTemp('');
+            setRtEventDesc(specialEvents[dateStr + ' ' + hourStr] || '');
+            setShowRealtimeModal(true);
+          };
+
+          const handleOpenCellEdit = (keyStr, station, currentVal) => {
+            const parts = keyStr.split(' ');
+            setRtDate(parts[0] || formatDate(new Date()));
+            setRtTime(parts[1] || '00:00');
+            setRtLocation(station);
+            setRtTemp(currentVal !== null && currentVal !== undefined ? String(currentVal) : '');
+            setRtEventDesc(specialEvents[keyStr] || '');
+            setShowRealtimeModal(true);
+          };
+
+          const handleRtDateTimeChange = (newDate, newTime) => {
+            setRtDate(newDate);
+            setRtTime(newTime);
+            if (newDate && newTime) setRtEventDesc(specialEvents[newDate + ' ' + newTime] || '');
+          };
+
+          const handleSaveRealtimeEntry = () => {
+            if (!rtDate || !rtTime) return addToast('請完整選擇時間', 'error');
+            if (rtTemp === '' && rtEventDesc.trim() === '') return addToast('請填寫溫度或事件', 'error');
+
+            const datetimeStr = rtDate + ' ' + rtTime;
+            const locIndex = STATIONS.indexOf(rtLocation);
+
+            const updatedData = { ...temperatureData };
+            if (!updatedData[datetimeStr]) updatedData[datetimeStr] = new Array(STATIONS.length).fill(null);
+            else updatedData[datetimeStr] = [...updatedData[datetimeStr]];
+
+            if (rtTemp !== '') updatedData[datetimeStr][locIndex] = parseFloat(rtTemp);
+            setTemperatureData(updatedData);
+
+            const updatedEvents = { ...specialEvents };
+            if (rtEventDesc.trim() !== '') updatedEvents[datetimeStr] = rtEventDesc.trim();
+            else if (updatedEvents[datetimeStr] && rtTemp !== '') delete updatedEvents[datetimeStr];
+            setSpecialEvents(updatedEvents);
+
+            syncDataToCloud(updatedData, updatedEvents);
+            setCurrentDate(new Date(rtDate));
+            setShowRealtimeModal(false);
+            addToast('✅ 已成功寫入 ' + datetimeStr + ' 的資料！', 'success');
+          };
+
+          const handleSmtExcelUpload = (event, targetLocation) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              try {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false });
+                if (jsonData.length < 2) throw new Error('表格格式不符');
+
+                const headers = jsonData[0].map(h => String(h || '').trim().toUpperCase());
+                let dateIdx = headers.findIndex(h => h.includes('時間') || h.includes('日') || h.includes('期') || h.includes('DATE'));
+                if (dateIdx === -1) dateIdx = 0;
+                let tempIdx = -1;
+                for (let i = 0; i < headers.length; i++) {
+                  if (i !== dateIdx && (headers[i].includes('溫度') || headers[i].includes('TEMP') || headers[i].includes('L1') || headers[i].includes('℃') || headers[i].includes('C'))) {
+                    tempIdx = i; break;
+                  }
+                }
+                if (tempIdx === -1) tempIdx = dateIdx + 1;
+
+                const locIndex = STATIONS.indexOf(targetLocation);
+                let importedCount = 0;
+                let latestDateStr = null;
+                const newData = { ...temperatureData };
+
+                for (let i = 1; i < jsonData.length; i++) {
+                  const row = jsonData[i];
+                  if (!row || row.length === 0) continue;
+                  let dateStr = row[dateIdx];
+                  if (!dateStr) continue;
+                  let formattedDateTime = formatDateTime(dateStr);
+                  if (!formattedDateTime) continue;
+
+                  let val = row[tempIdx];
+                  if (val !== undefined && val !== null && !String(val).includes('-') && !String(val).includes('FALSE') && !String(val).includes('颱')) {
+                    const num = parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+                    if (!isNaN(num)) {
+                      if (!newData[formattedDateTime]) newData[formattedDateTime] = new Array(STATIONS.length).fill(null);
+                      else newData[formattedDateTime] = [...newData[formattedDateTime]];
+                      newData[formattedDateTime][locIndex] = num;
+                      importedCount++;
+                      latestDateStr = formattedDateTime.split(' ')[0];
+                    }
+                  }
+                }
+                setTemperatureData(newData);
+                syncDataToCloud(newData, specialEvents);
+                if (latestDateStr) setCurrentDate(new Date(latestDateStr));
+                addToast('🎉 成功匯入 ' + importedCount + ' 筆 ' + targetLocation + ' 數據！', 'success');
+                setShowSmtImportModal(false);
+              } catch (err) { addToast('❌ 解析失敗: ' + err.message, 'error'); }
+            };
+            reader.readAsArrayBuffer(file);
+            event.target.value = '';
+          };
+
+          const handleFullExcelUpload = (event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              try {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array', cellDates: true });
+                const worksheet = workbook.Sheets[workbook.SheetNames[0]];
+                const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, raw: false });
+                if (jsonData.length < 2) throw new Error('表格格式不符');
+
+                const headers = jsonData[0].map(h => String(h || '').trim().toUpperCase());
+                let dateIdx = headers.findIndex(h => h.includes('時間') || h.includes('日') || h.includes('期') || h.includes('DATE'));
+                if (dateIdx === -1) dateIdx = 0;
+
+                const stationIndices = STATIONS.map(station => {
+                  const sClean = station.toUpperCase().replace(/\s+/g, '');
+                  return headers.findIndex(h => h.replace(/\s+/g, '').includes(sClean) || h.includes(station));
+                });
+                const eventIdx = headers.findIndex(h => h.includes('備註') || h.includes('事件') || h.includes('NOTE'));
+
+                const newData = { ...temperatureData };
+                const newEvents = { ...specialEvents };
+                let importedCount = 0;
+                let latestDateStr = null;
+
+                for (let i = 1; i < jsonData.length; i++) {
+                  const row = jsonData[i];
+                  if (!row || row.length === 0) continue;
+                  let dateStr = row[dateIdx];
+                  if (!dateStr) continue;
+                  let formattedDateTime = formatDateTime(dateStr);
+                  if (!formattedDateTime) continue;
+
+                  if (!newData[formattedDateTime]) newData[formattedDateTime] = new Array(STATIONS.length).fill(null);
+                  else newData[formattedDateTime] = [...newData[formattedDateTime]];
+
+                  let rowHasValue = false;
+                  stationIndices.forEach((colIdx, stIndex) => {
+                    if (colIdx !== -1 && row[colIdx] !== undefined && row[colIdx] !== null) {
+                      const rawStr = String(row[colIdx]).trim();
+                      if (rawStr && !rawStr.includes('FALSE') && !rawStr.includes('颱')) {
+                        const num = parseFloat(rawStr.replace(/[^0-9.-]/g, ''));
+                        if (!isNaN(num)) { newData[formattedDateTime][stIndex] = num; rowHasValue = true; }
+                      }
+                    }
+                  });
+
+                  if (eventIdx !== -1 && row[eventIdx]) {
+                    const noteStr = String(row[eventIdx]).trim();
+                    if (noteStr) { newEvents[formattedDateTime] = noteStr; rowHasValue = true; }
+                  }
+
+                  if (rowHasValue) { importedCount++; latestDateStr = formattedDateTime.split(' ')[0]; }
+                }
+
+                setTemperatureData(newData);
+                setSpecialEvents(newEvents);
+                if (gasUrl.trim()) syncDataToCloud(newData, newEvents);
+                if (latestDateStr) setCurrentDate(new Date(latestDateStr));
+                addToast('🎉 成功匯入 ' + importedCount + ' 筆全區資料！', 'success');
+                setShowSmtImportModal(false);
+              } catch (err) { addToast('❌ 解析失敗: ' + err.message, 'error'); }
+            };
+            reader.readAsArrayBuffer(file);
+            event.target.value = '';
+          };
+
+          const handleExportToExcel = () => {
+            try {
+              const allKeys = Object.keys(temperatureData).sort();
+              if (allKeys.length === 0) return addToast('無資料可匯出', 'info');
+              const rows = allKeys.map(key => {
+                const dataArr = temperatureData[key] || [];
+                return {
+                  '日期時間': key,
+                  'AA 2F': dataArr[0] ?? '', 'AA 3F': dataArr[1] ?? '',
+                  'SMT L1': dataArr[2] ?? '', 'SMT L2': dataArr[3] ?? '', 'SMT L3': dataArr[4] ?? '',
+                  '特殊事件': specialEvents[key] || ''
+                };
+              });
+              const worksheet = XLSX.utils.json_to_sheet(rows);
+              const workbook = XLSX.utils.book_new();
+              XLSX.utils.book_append_sheet(workbook, worksheet, '溫度紀錄表');
+              XLSX.writeFile(workbook, '生產環境溫度管控表_' + formatDate(new Date()) + '.xlsx');
+              addToast('已成功匯出 Excel', 'success');
+            } catch (err) { addToast('匯出失敗: ' + err.message, 'error'); }
+          };
+
+          const handleResetData = () => setShowResetModal(true);
+          const executeResetData = (clearCloud = false) => {
+            localStorage.removeItem('tempControlData_HourlyV1');
+            localStorage.removeItem('tempControlEvents_HourlyV1');
+            setTemperatureData({});
+            setSpecialEvents({});
+            if (clearCloud && gasUrl.trim()) {
+              syncDataToCloud({}, {});
+              addToast('🧹 本機與雲端已清空！', 'success');
+            } else {
+              addToast('🧹 本機資料已清空！', 'success');
+            }
+            setShowResetModal(false);
+          };
+
+          const handleSaveGasUrl = () => {
+            const trimmed = gasInput.trim();
+            setGasUrl(trimmed);
+            localStorage.setItem('tempControlGasUrl_V1', trimmed);
+            setShowGasModal(false);
+            if (trimmed) {
+              addToast('✅ 設定完成，同步中...', 'success');
+              syncDataToCloud(temperatureData, specialEvents);
+            } else addToast('已清除網址', 'info');
+          };
+
+          // --- 渲染 UI (手機版) ---
+          if (isMobileView) {
+            const parsedTemp = parseFloat(mobileTemp);
+            const isNormal = !isNaN(parsedTemp) && parsedTemp >= CONTROL_LOWER && parsedTemp <= CONTROL_UPPER;
+            const currentSlotKey = mobileDate + ' ' + mobileTime;
+            const currentSlotData = temperatureData[currentSlotKey] || [];
+
+            return (
+              <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans pb-12">
+                <header className="bg-slate-950 px-3 py-2.5 flex items-center justify-between sticky top-0 z-30 shadow-md">
+                  <div className="flex items-center gap-2">
+                    <Smartphone className="w-5 h-5 text-amber-500" />
+                    <div>
+                      <h1 className="text-sm font-bold text-white">巡檢填寫與雲端同步</h1>
+                      <p className="text-[10px] text-amber-400">直連雲端寫入</p>
+                    </div>
+                  </div>
+                  <div className="flex gap-1.5">
+                    {gasUrl ? 
+                      <button onClick={()=>syncDataFromCloud(false)} disabled={isSyncing} className="bg-emerald-500/20 text-emerald-300 px-2 py-1 rounded text-xs font-bold flex items-center border border-emerald-500/40">
+                         <RefreshCw className={"w-3.5 h-3.5 mr-1 " + (isSyncing?'animate-spin':'')}/> {isSyncing ? '同步中' : '已連線'}
+                      </button> :
+                      <button onClick={()=>setShowGasModal(true)} className="bg-rose-500/20 text-rose-300 px-2 py-1 rounded text-xs font-bold flex items-center border border-rose-500/40">
+                         <Database className="w-3.5 h-3.5 mr-1"/> 未設定
+                      </button>
+                    }
+                    <button onClick={switchToDesktopView} className="bg-blue-600 px-2 py-1 rounded text-xs font-bold">電腦版</button>
+                  </div>
+                </header>
+
+                <div className="fixed top-14 left-0 right-0 z-50 px-4 flex flex-col gap-2 pointer-events-none">
+                  {toasts.map(t => <div key={t.id} className={"p-3 rounded-lg shadow-xl text-sm font-bold " + (t.type==='success'?'bg-emerald-600':'bg-rose-600')}>{t.text}</div>)}
+                </div>
+
+                <div className="p-4 space-y-4 max-w-lg mx-auto w-full">
+                  {!gasUrl.trim() && (
+                    <div className="bg-amber-950 border border-amber-600 p-3 rounded-lg text-amber-200 text-xs flex justify-between items-center">
+                      <span>尚未綁定 GAS 網址</span>
+                      <button onClick={()=>setShowGasModal(true)} className="bg-amber-500 text-black px-2 py-1 rounded font-bold">設定</button>
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-slate-400">1. 選擇測點位置</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {STATIONS.map((st, i) => {
+                        const hasVal = currentSlotData[i] !== undefined && currentSlotData[i] !== null;
+                        return (
+                          <button key={st} onClick={() => { setMobileLocation(st); if(hasVal) setMobileTemp(String(currentSlotData[i])); }}
+                            className={"p-2.5 rounded-xl font-bold border flex flex-col items-center " + (mobileLocation===st ? 'bg-amber-500 text-black border-amber-400 scale-[1.02] transition-transform' : 'bg-slate-800 text-slate-300 border-slate-700')}>
+                            <span>{st}</span>
+                            <span className={"text-[10px] mt-1 " + (hasVal && mobileLocation===st ? 'text-black' : hasVal ? 'text-emerald-400' : 'text-slate-500')}>{hasVal ? currentSlotData[i] + '°C ✓' : '未登錄'}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="text-xs font-bold text-slate-400">日期</label>
+                      <input type="date" value={mobileDate} onChange={e=>setMobileDate(e.target.value)} className="w-full bg-slate-800 border border-slate-700 p-2.5 rounded-xl text-sm text-white focus:outline-none focus:border-amber-500" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-slate-400">時段</label>
+                      <select value={mobileTime} onChange={e=>setMobileTime(e.target.value)} className="w-full bg-slate-800 border border-slate-700 p-2.5 rounded-xl text-sm text-white focus:outline-none focus:border-amber-500">
+                        {Array.from({length:24}).map((_,i) => {
+                          const h = String(i).padStart(2,'0')+':00';
+                          return <option key={h} value={h}>{h}</option>
+                        })}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-800 p-4 rounded-xl border border-slate-700">
+                    <div className="flex justify-between items-center mb-3">
+                      <label className="text-xs font-bold text-amber-400 flex items-center gap-1"><Thermometer className="w-4 h-4"/> 2. 實測溫度 (°C)</label>
+                      <span className={"text-xs px-2 py-0.5 rounded-full font-bold border " + (isNormal ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border-rose-500/30')}>{isNormal?'20~30°C 正常':'⚠️ 過高管制'}</span>
+                    </div>
+                    <div className="flex mt-2 items-center justify-between gap-1.5 w-full">
+                       <button onClick={() => setMobileTemp(String((parseFloat(mobileTemp)-0.5).toFixed(1)))} className="bg-slate-700 w-10 h-10 rounded-xl flex items-center justify-center font-bold text-xl shrink-0"><Minus className="w-5 h-5"/></button>
+                       <input type="number" step="0.1" value={mobileTemp} onChange={e => setMobileTemp(e.target.value)} className="flex-1 w-16 min-w-0 bg-slate-900 border-2 border-amber-500 rounded-xl text-center text-3xl font-black text-amber-400 py-2 focus:outline-none" />
+                       <button onClick={() => setMobileTemp(String((parseFloat(mobileTemp)+0.5).toFixed(1)))} className="bg-slate-700 w-10 h-10 rounded-xl flex items-center justify-center font-bold text-xl shrink-0"><Plus className="w-5 h-5"/></button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-bold text-slate-400 block mb-1.5">3. 事件備註</label>
+                    <input type="text" placeholder="選填，例如：冷氣保養" value={mobileEventDesc} onChange={e=>setMobileEventDesc(e.target.value)} className="w-full bg-slate-800 border border-slate-700 p-3 rounded-xl text-sm text-white focus:outline-none focus:border-amber-500" />
+                  </div>
+
+                  <button onClick={handleMobileSave} className="w-full bg-amber-500 active:scale-95 text-black font-black text-lg py-3.5 rounded-xl flex justify-center items-center gap-2 transition-transform shadow-xl">
+                    <CheckCircle2 className="w-6 h-6"/> 一鍵寫入同步雲端
+                  </button>
+                </div>
+              </div>
+            );
+          }
+
+          // --- 電腦版主介面 ---
+          return (
+            <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-slate-800 pb-10">
+                {/* Toasts */}
+                <div className="fixed top-5 right-5 z-50 flex flex-col gap-2 pointer-events-none w-80">
+                    {toasts.map(t => (
+                        <div key={t.id} className={"p-3.5 rounded-xl shadow-xl text-sm font-bold flex items-center gap-2 pointer-events-auto " + (t.type==='success'?'bg-emerald-600 text-white': t.type==='error'?'bg-rose-600 text-white':'bg-slate-800 text-white')}>
+                            {t.type==='success' && <CheckCircle2 className="w-5 h-5"/>}
+                            {t.type==='error' && <AlertCircle className="w-5 h-5"/>}
+                            <span>{t.text}</span>
+                        </div>
+                    ))}
+                </div>
+
+                {/* 導覽列 */}
+                <nav className="bg-slate-900 text-white shadow-md sticky top-0 z-10 p-3">
+                    <div className="max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center gap-3">
+                        <div className="flex items-center gap-2">
+                            <Thermometer className="w-6 h-6 text-blue-400"/>
+                            <h1 className="text-xl font-bold">生產環境溫度管控 <span className="text-xs text-blue-300">V1.5</span></h1>
+                        </div>
+                        <div className="flex flex-wrap gap-2 justify-center">
+                            <button onClick={handleOpenRealtimeModal} className="bg-amber-500 text-black px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1"><Plus className="w-3.5 h-3.5"/> 手動輸入</button>
+                            <button onClick={()=>setShowQrModal(true)} className="bg-indigo-600 px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1"><QrCodeIcon className="w-3.5 h-3.5"/> 掃碼輸入</button>
+                            <button onClick={()=>setShowSmtImportModal(true)} className="bg-purple-600 px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1"><Upload className="w-3.5 h-3.5"/> 檔案匯入</button>
+                            <button onClick={()=>syncDataFromCloud(false)} disabled={isSyncing} className="bg-emerald-600 px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1"><RefreshCw className={"w-3.5 h-3.5 " + (isSyncing?'animate-spin':'')}/> 同步雲端</button>
+                            <button onClick={handleExportToExcel} className="bg-slate-700 px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1"><Download className="w-3.5 h-3.5"/> 匯出公版</button>
+                            <button onClick={handleOpenAdminSettings} className={"px-3 py-1.5 rounded-md font-bold text-xs flex items-center gap-1 " + (isAdminUnlocked?'bg-rose-600':'bg-slate-800 border border-amber-500 text-amber-300')}><Lock className="w-3.5 h-3.5"/> 管理設定</button>
+                        </div>
+                    </div>
+                </nav>
+
+                <div className="max-w-7xl mx-auto p-4 w-full space-y-6 mt-4">
+                    {/* GAS 狀態區 */}
+                    <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex justify-between items-center">
+                        <div>
+                            <h3 className="font-bold flex items-center gap-2"><Database className="text-emerald-500 w-5 h-5"/> GAS 雲端資料庫 {gasUrl ? <span className="text-xs bg-emerald-100 text-emerald-700 px-2 rounded-full">已預設綁定</span> : <span className="text-xs bg-amber-100 text-amber-700 px-2 rounded-full">未綁定</span>}</h3>
+                            <p className="text-xs text-slate-500 mt-1">{gasUrl || '綁定 GAS 以同步雲端表格'}</p>
+                        </div>
+                        <button onClick={switchToMobileView} className="bg-indigo-50 text-indigo-700 border border-indigo-200 px-3 py-2 rounded-lg text-xs font-bold flex items-center gap-1"><Smartphone className="w-4 h-4"/> 開啟手機介面</button>
+                    </div>
+
+                    {/* 圖表區 */}
+                    <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                        <div className="flex justify-between items-center mb-4 border-b pb-2">
+                            <h2 className="font-bold text-lg flex items-center gap-2"><BarChart3 className="text-blue-500"/> 全線溫度趨勢</h2>
+                            <div className="flex gap-2">
+                                <button onClick={()=>changeWeek(-1)} className="p-1.5 bg-slate-100 rounded-lg hover:bg-slate-200"><ChevronLeft/></button>
+                                <span className="font-bold bg-slate-100 px-3 py-1.5 rounded-lg text-sm">{formatDate(startOfWeek)} ~ {formatDate(endOfWeek)}</span>
+                                <button onClick={()=>changeWeek(1)} className="p-1.5 bg-slate-100 rounded-lg hover:bg-slate-200"><ChevronRight/></button>
+                            </div>
+                        </div>
+                        <div className="h-72"><SafeLineChart data={chartData} options={chartOptions} /></div>
+                    </div>
+
+                    {/* 表格區 */}
+                    <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 overflow-x-auto">
+                        <table className="w-full text-sm text-left">
+                            <thead className="bg-slate-50 border-b">
+                                <tr>
+                                    <th className="p-3">日期時間</th>
+                                    {STATIONS.map(st => <th key={st} className="p-3 text-center"><span className={"inline-block px-2.5 py-0.5 rounded-md " + (st.includes('SMT') ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800')}>{st}</span></th>)}
+                                    <th className="p-3">事件備註</th>
+                                </tr>
+                            </thead>
+                            <tbody className="font-mono">
+                                {weekTimeKeys.map(k => (
+                                    <tr key={k} className="border-b hover:bg-slate-50">
+                                        <td className="p-3 font-bold text-slate-700">{k}</td>
+                                        {STATIONS.map((st, i) => {
+                                            const val = temperatureData[k]?.[i];
+                                            return (
+                                                <td key={st} className="p-3 text-center cursor-pointer hover:bg-amber-50" onClick={()=>handleOpenCellEdit(k, st, val)}>
+                                                    {val !== undefined && val !== null ? <span className="font-bold bg-slate-100 px-2.5 py-1 rounded-md text-xs">{val}°C</span> : <span className="text-slate-300 text-xs font-sans hover:text-amber-500">+ 填寫</span>}
+                                                </td>
+                                            )
+                                        })}
+                                        <td className="p-3 text-slate-500 text-xs cursor-pointer hover:bg-amber-50 font-sans" onClick={()=>handleOpenCellEdit(k, STATIONS[0], null)}>
+                                            {specialEvents[k] ? <span className="bg-amber-50 text-amber-800 border border-amber-200 px-2 py-1 rounded">📌 {specialEvents[k]}</span> : '+ 備註'}
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                {/* --- 彈出視窗群 --- */}
+                {/* 1. 手動輸入 Modal */}
+                {showRealtimeModal && (
+                    <div className="fixed inset-0 bg-black/60 flex justify-center items-center z-50 p-4">
+                        <div className="bg-white p-6 rounded-xl w-full max-w-md shadow-2xl">
+                            <h3 className="font-bold text-lg mb-4 border-b pb-2 flex items-center gap-2"><Plus className="text-amber-500 w-5 h-5"/> 手動修改 / 填寫數據</h3>
+                            <div className="space-y-3">
+                                <div><label className="text-xs font-bold text-slate-500">測點位置</label><select className="w-full border border-slate-300 bg-slate-50 font-bold p-2.5 rounded-lg mt-1" value={rtLocation} onChange={e=>setRtLocation(e.target.value)}>{STATIONS.map(s=><option key={s}>{s}</option>)}</select></div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div><label className="text-xs font-bold text-slate-500">日期</label><input type="date" className="w-full border border-slate-300 bg-slate-50 p-2 rounded-lg mt-1" value={rtDate} onChange={e=>handleRtDateTimeChange(e.target.value, rtTime)}/></div>
+                                    <div><label className="text-xs font-bold text-slate-500">時間點</label><select className="w-full border border-slate-300 bg-slate-50 p-2 rounded-lg mt-1" value={rtTime} onChange={e=>handleRtDateTimeChange(rtDate, e.target.value)}>{Array.from({length:24}).map((_,i)=>{const h=String(i).padStart(2,'0')+':00';return<option key={h}>{h}</option>})}</select></div>
+                                </div>
+                                <div><label className="text-xs font-bold text-slate-500">實測溫度 (°C)</label><input type="number" step="0.1" className="w-full border border-slate-300 bg-slate-50 font-bold p-2.5 rounded-lg mt-1" value={rtTemp} onChange={e=>setRtTemp(e.target.value)} placeholder="例如: 25.0"/></div>
+                                <div><label className="text-xs font-bold text-slate-500">備註 (選填)</label><input type="text" className="w-full border border-slate-300 bg-slate-50 p-2.5 rounded-lg mt-1" value={rtEventDesc} onChange={e=>setRtEventDesc(e.target.value)} placeholder="事件紀錄"/></div>
+                            </div>
+                            <div className="flex gap-2 mt-5">
+                                <button onClick={()=>setShowRealtimeModal(false)} className="w-1/2 bg-slate-100 hover:bg-slate-200 text-slate-700 p-2.5 rounded-lg font-bold text-sm">取消</button>
+                                <button onClick={handleSaveRealtimeEntry} className="w-1/2 bg-amber-500 hover:bg-amber-400 text-slate-900 p-2.5 rounded-lg font-bold text-sm">儲存寫入</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* 2. QR Code Modal */}
+                {showQrModal && (
+                    <div className="fixed inset-0 bg-black/60 flex justify-center items-center z-50 p-4" onClick={(e) => { if(e.target===e.currentTarget) setShowQrModal(false) }}>
+                        <div className="bg-white p-6 rounded-xl w-full max-w-sm text-center shadow-2xl">
+                            <h3 className="font-bold text-lg mb-2 flex justify-center items-center gap-2"><Smartphone className="w-5 h-5 text-indigo-600"/> 手機巡檢 QR Code</h3>
+                            <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 mb-4 inline-block shadow-inner">
+                                <img src={qrCodeDataUrl} className="mx-auto w-48 h-48 rounded" />
+                            </div>
+                            <div className="text-left mb-4">
+                                <label className="text-xs font-bold text-slate-500">自動掃碼連結 (含參數)</label>
+                                <input readOnly value={targetMobileUrl} className="w-full bg-slate-100 text-xs font-mono p-2 rounded border border-slate-200 mt-1" />
+                            </div>
+                            <div className="flex gap-2">
+                                <button onClick={copyMobileLink} className="w-1/2 bg-indigo-50 border border-indigo-200 text-indigo-700 py-2 rounded-lg font-bold text-xs"><Copy className="w-3.5 h-3.5 inline mr-1"/> 複製網址</button>
+                                <button onClick={downloadQrCodeImage} className="w-1/2 bg-emerald-50 border border-emerald-200 text-emerald-700 py-2 rounded-lg font-bold text-xs"><Download className="w-3.5 h-3.5 inline mr-1"/> 下載圖檔</button>
+                            </div>
+                            <button onClick={()=>setShowQrModal(false)} className="w-full bg-slate-100 text-slate-700 border py-2 rounded-lg font-bold mt-2 text-sm">關閉</button>
+                        </div>
+                    </div>
+                )}
+
+                {/* 3. 匯入 Modal */}
+                {showSmtImportModal && (
+                    <div className="fixed inset-0 bg-black/60 flex justify-center items-center z-50 p-4">
+                        <div className="bg-white p-6 rounded-2xl w-full max-w-xl shadow-2xl">
+                            <div className="flex justify-between items-center mb-5 border-b pb-2">
+                                <h3 className="font-bold text-xl flex items-center gap-2"><div className="w-3 h-3 bg-purple-500 rounded-full"></div> Excel 數據匯入站</h3>
+                                <button onClick={()=>setShowSmtImportModal(false)} className="text-slate-400 hover:text-slate-600"><X/></button>
+                            </div>
+                            
+                            <div className="bg-gradient-to-r from-purple-900 to-indigo-900 text-white p-5 rounded-xl flex flex-col sm:flex-row justify-between items-center gap-4 mb-5 shadow-md">
+                                <div>
+                                    <h4 className="font-bold text-base mb-1">A. 全區歷史總表一鍵匯入</h4>
+                                    <p className="text-xs text-purple-200">支援 AA / SMT 所有測點自動對應，直接寫入雲端。</p>
+                                </div>
+                                <label className="bg-amber-400 text-black px-4 py-2.5 rounded-xl font-bold cursor-pointer text-sm shadow-md shrink-0 flex items-center gap-2 hover:bg-amber-300">
+                                    <FileSpreadsheet className="w-4 h-4"/> 選擇檔案
+                                    <input type="file" className="hidden" accept=".xlsx,.xls" onChange={handleFullExcelUpload}/>
+                                </label>
+                            </div>
+                            
+                            <h4 className="font-bold text-slate-700 mb-2 text-sm bg-slate-200 inline-block px-2 py-0.5 rounded">B. 單線別獨立上傳</h4>
+                            <p className="text-xs text-slate-500 mb-3">過濾雜訊，僅將該單線溫值寫入指定測點。</p>
+                            <div className="grid grid-cols-3 gap-3">
+                                {['SMT L1', 'SMT L2', 'SMT L3'].map(line => (
+                                    <div key={line} className="border border-slate-200 p-3.5 rounded-xl text-center bg-slate-50 flex flex-col justify-between h-full">
+                                        <div className="font-bold text-xs bg-purple-100 text-purple-800 rounded-full px-2 py-1 mb-3 inline-block mx-auto">{line}</div>
+                                        <label className="border border-dashed border-purple-300 hover:bg-purple-50 text-purple-600 px-2 py-2 rounded-lg text-xs cursor-pointer block font-bold transition-colors">
+                                            選擇檔案<input type="file" className="hidden" accept=".xlsx,.xls" onChange={e=>handleSmtExcelUpload(e, line)}/>
+                                        </label>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* ✨ 安全升級：管理員認證 Modal (移除了畫面上 8888 的提示) */}
+                {showAdminAuthModal && (
+                    <div className="fixed inset-0 bg-black/70 flex justify-center items-center z-50 p-4">
+                        <div className="bg-white p-6 rounded-2xl w-full max-w-sm shadow-2xl border">
+                            <h3 className="font-bold text-lg mb-4 flex items-center gap-2"><Lock className="text-amber-500 bg-amber-100 p-1.5 w-8 h-8 rounded-full"/> 管理員驗證</h3>
+                            <p className="text-xs text-slate-500 mb-3">請輸入管理員密碼以進行系統設定。</p>
+                            <div className="relative mb-2">
+                                <input type="password" value={adminPinInput} onChange={e=>setAdminPinInput(e.target.value)} placeholder="輸入密碼" className="w-full border border-slate-300 p-3 rounded-xl font-mono text-sm bg-slate-50 focus:outline-none focus:border-amber-500" autoFocus />
+                                <Key className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
+                            </div>
+                            {adminPinError && <p className="text-rose-600 text-xs mb-3 flex items-center gap-1"><AlertCircle className="w-3.5 h-3.5"/> {adminPinError}</p>}
+                            <div className="flex gap-2 mt-4">
+                                <button onClick={()=>setShowAdminAuthModal(false)} className="w-1/2 bg-slate-100 hover:bg-slate-200 p-2.5 rounded-xl font-bold text-sm text-slate-700">取消</button>
+                                <button onClick={handleVerifyAdminPin} className="w-1/2 bg-amber-500 hover:bg-amber-400 text-slate-900 p-2.5 rounded-xl font-bold text-sm shadow-sm flex items-center justify-center gap-1"><ShieldCheck className="w-4 h-4"/> 驗證進入</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* 5. 管理員控制台 Modal */}
+                {showAdminPanelModal && (
+                    <div className="fixed inset-0 bg-black/70 flex justify-center items-center z-50 p-4">
+                        <div className="bg-white p-6 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl border">
+                            <div className="flex justify-between items-center mb-6 pb-3 border-b">
+                                <div>
+                                    <h3 className="font-black text-xl flex items-center gap-2"><ShieldCheck className="text-amber-500 w-8 h-8 bg-amber-100 p-1.5 rounded-lg"/> 管理員核心設定</h3>
+                                    <p className="text-xs text-emerald-600 font-bold mt-1">權限已驗證 ‧ 個人專屬管理頁面</p>
+                                </div>
+                                <button onClick={handleLockAdminPanel} className="bg-slate-100 hover:bg-slate-200 px-3 py-1.5 rounded-lg text-sm font-bold flex items-center gap-1 text-slate-700"><Lock className="w-3.5 h-3.5 text-amber-600"/> 鎖定離開</button>
+                            </div>
+
+                            <div className="space-y-4">
+                                {/* GAS Config */}
+                                <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl">
+                                    <div className="flex justify-between items-center mb-2">
+                                        <h4 className="font-bold text-sm flex items-center gap-1.5"><Database className="text-emerald-600 w-4 h-4"/> 1. Google 試算表 (GAS) 雲端 API 網址</h4>
+                                        <span className="text-[10px] bg-amber-100 text-amber-800 px-2 rounded-full font-bold">預設已寫死綁定</span>
+                                    </div>
+                                    <div className="flex gap-2">
+                                        <input type="text" value={gasInput} onChange={e=>setGasInput(e.target.value)} placeholder="https://script.google.com/macros/s/..." className="flex-1 border p-2.5 rounded-lg text-xs font-mono bg-white focus:outline-none focus:border-emerald-500" />
+                                        <button onClick={handleSaveGasUrl} className="bg-emerald-600 text-white px-4 py-2.5 rounded-lg text-sm font-bold shadow-sm hover:bg-emerald-500">儲存覆蓋</button>
+                                    </div>
+                                    <div className="mt-3 flex justify-between items-center">
+                                        <button onClick={testGasConnection} className="text-xs bg-slate-800 hover:bg-slate-700 text-white px-3 py-2 rounded-lg font-bold flex items-center gap-1.5"><RefreshCw className={"w-3.5 h-3.5 " + (testStatus.running?'animate-spin':'')}/> 測試連線狀態</button>
+                                        <button onClick={copyGasCode} className="text-xs border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 px-3 py-2 rounded-lg font-bold flex items-center gap-1.5"><Copy className="w-3.5 h-3.5"/> {gasCodeCopied ? '已複製！' : '複製 GAS 程式碼'}</button>
+                                    </div>
+                                    {testStatus.message && <div className={"mt-3 p-3 rounded-lg text-xs font-bold border " + (testStatus.type==='success'?'bg-emerald-50 text-emerald-800 border-emerald-200':'bg-rose-50 text-rose-800 border-rose-200')}>{testStatus.message}</div>}
+                                </div>
+
+                                {/* Reset Data */}
+                                <div className="bg-rose-50/60 border border-rose-200 p-5 rounded-xl">
+                                    <div className="flex justify-between items-center mb-2">
+                                        <h4 className="font-bold text-sm text-rose-900 flex items-center gap-1.5"><RotateCcw className="w-4 h-4 text-rose-600"/> 2. 系統資料重置</h4>
+                                        <span className="text-[10px] bg-rose-100 text-rose-700 px-2 rounded-full font-bold">特權操作</span>
+                                    </div>
+                                    <p className="text-xs text-rose-700 mb-4">清空所有本機暫存，準備重新匯入舊資料。這將無法復原。</p>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button onClick={()=>executeResetData(false)} className="bg-rose-600 hover:bg-rose-700 text-white py-2.5 rounded-lg text-sm font-bold flex justify-center items-center gap-1.5 shadow-sm"><Trash2 className="w-4 h-4"/> 清空本機暫存</button>
+                                        {gasUrl && <button onClick={()=>executeResetData(true)} className="bg-slate-900 hover:bg-slate-800 text-rose-200 py-2.5 rounded-lg text-sm font-bold flex justify-center items-center gap-1.5 shadow-sm"><Database className="w-4 h-4 text-rose-400"/> 連同雲端一併清空</button>}
+                                    </div>
+                                </div>
+
+                                {/* Change Password */}
+                                <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl">
+                                    <h4 className="font-bold text-sm flex items-center gap-1.5 mb-3"><Key className="w-4 h-4 text-amber-600"/> 3. 變更管理員密碼</h4>
+                                    <div className="flex gap-2">
+                                        <input type="password" value={adminNewPinInput} onChange={e=>setAdminNewPinInput(e.target.value)} placeholder="輸入新密碼" className="flex-1 border border-slate-300 bg-white p-2.5 rounded-lg font-mono text-sm focus:outline-none focus:border-amber-500" />
+                                        <button onClick={handleChangeAdminPin} className="bg-amber-500 hover:bg-amber-400 text-slate-900 px-5 rounded-lg text-sm font-bold shadow-sm">更新</button>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="mt-5 pt-3 border-t text-right">
+                                <button onClick={handleLockAdminPanel} className="bg-slate-900 text-white px-6 py-2.5 rounded-xl font-bold text-sm shadow-sm hover:bg-slate-800">完成設定</button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<ErrorBoundary><App /></ErrorBoundary>);
+    </script>
+</body>
+</html>
